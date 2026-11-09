@@ -1,0 +1,299 @@
+import {
+    Button,
+    LineEdit,
+    ComboBox,
+    CheckBox,
+    ScrollView,
+    VerticalBox,
+    HorizontalBox,
+    GroupBox,
+    RadioGroup,
+} from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "Zenoh Echo Tester";
+    width: 1024px;
+    height: 768px;
+    background: #f3f5f9;
+
+    // Rust 백엔드와 연결할 속성
+    in-out property <bool> connected: false;
+    in-out property <string> session-status: "Disconnected";
+    in-out property <string> serial-port: "/dev/scrubber-controller";
+    in-out property <string> baud-rate: "115200";
+    in-out property <string> selected-mode: "client";
+
+    in-out property <int> tx-count: 0;
+    in-out property <int> rx-count: 0;
+    in-out property <int> error-count: 0;
+    in-out property <string> rtt-text: "-- ms";
+    in-out property <string> log-text: "Waiting for communication...";
+
+    // Rust에서 구현할 Callback
+    callback connect-requested(string, string);
+    callback disconnect-requested();
+    callback send-requested(string);
+    callback clear-log-requested();
+    callback mode-changed(string);
+
+    ScrollView {
+
+        VerticalBox {
+            padding: 15px;
+
+            // HEADER
+            Rectangle {
+                height: 70px;
+                background: #1e293b;
+                border-radius: 8px;
+
+                HorizontalBox {
+                    VerticalBox {
+                        Text {
+                            text: "Zenoh Echo Tester";
+                            color: white;
+                            font-size: 23px;
+                            font-weight: 700;
+                        }
+
+                        Text {
+                            text: "Raspberry Pi 5  ↔  STM32C562VET6";
+                            color: #cbd5e1;
+                            font-size: 12px;
+                        }
+                    }
+
+                    Rectangle {
+                        width: 160px;
+                        background: transparent;
+
+                        Text {
+                            text: root.session-status;
+                            color: root.connected ? #4ade80 : #f87171;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // CONNECTION PANEL
+            GroupBox {
+                title: "01. Connection";
+                height: 250px;
+
+                VerticalBox {
+                    HorizontalBox {
+                        VerticalBox {
+                            Text {
+                                text: "Serial Port";
+                            }
+
+                            port-input := LineEdit {
+                                text: root.serial-port;
+                                enabled: !root.connected;
+                            }
+                        }
+
+                        VerticalBox {
+                            Text {
+                                text: "Baud Rate";
+                            }
+
+                            baud-select := ComboBox {
+                                model: ["115200", "57600", "230400"];
+                                current-value: root.baud-rate;
+                                enabled: !root.connected;
+                            }
+                        }
+                    }
+
+                    HorizontalBox {
+                        Button {
+                            text: root.connected ? "Disconnect" : "Connect";
+
+                            clicked => {
+                                if (root.connected) {
+                                    root.disconnect-requested();
+                                }
+                                else {
+                                    root.connect-requested(
+                                        port-input.text, 
+                                        baud-select.current-value);
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "Session: " + root.session-status;
+                            color: #64748b;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    HorizontalBox {
+                        spacing: 100px;
+                        Text {
+                            text: "RPI Mode";
+                            vertical-alignment: center;
+                            font-size: 20px;
+                        }
+
+                        RadioGroup {
+                            orientation: horizontal;
+
+                            enabled: !root.connected;
+
+                            selected(value) => {
+                                root.selected-mode = value;
+                                root.mode-changed(value);
+                            }
+
+                            RadioButton {
+                                checked: true;
+                                text: "Client";
+                            }
+
+                            RadioButton {
+                                text: "Peer";
+                            }
+                        }
+                    }
+                }
+            }
+
+            //ECHO PANEL
+            GroupBox {
+                title: "02. Echo Message";
+                height: 170px;
+
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 10px;
+
+                    Text {
+                        text: "Message Payload (UTF-8)";
+                    }
+
+                    message-input := LineEdit {
+                        text: "Hello STM32!";
+                        placeholder-text: "Enter message...";
+                    }
+
+                    HorizontalBox {
+                        spacing: 12px;
+
+                        Button {
+                            text: "Send Echo";
+                            enabled: root.connected;
+
+                            clicked => {
+                                root.send-requested(message-input.text);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // LOG PANEL
+            GroupBox {
+                title: "03. Communication Log";
+                height: 240px;
+
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 8px;
+
+                    ScrollView {
+                        width: 950px;
+                        height: 130px;
+                        vertical-stretch: 1;
+
+                        Text {
+                            width: 900px;
+                            text: root.log-text;
+                            horizontal-alignment: start;
+                            font-family: "monospace";
+                            font-size: 15px;
+                            color: #334155;
+                            wrap: char-wrap;
+                        }
+                    }
+
+                    HorizontalBox {
+                        Button {
+                            text: "Clear Log";
+
+                            clicked => {
+                                root.clear-log-requested();
+                            }
+                        }
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "04. Communication Statistics";
+                height: 150px;
+
+                HorizontalBox {
+                    padding: 12px;
+                    spacing: 12px;
+
+                    VerticalBox {
+                        Text {
+                            text: "TX Count";
+                        }
+
+                        Text {
+                            text: root.tx-count;
+                            font-size: 24px;
+                            font-weight: 700;
+                            color: #2563eb;
+                        }
+                    }
+
+                    VerticalBox {
+                        Text {
+                            text: "RX Count";
+                        }
+
+                        Text {
+                            text: root.rx-count;
+                            font-size: 24px;
+                            font-weight: 700;
+                            color: #16a34a;
+                        }
+                    }
+
+                    VerticalBox {
+                        Text {
+                            text: "Errors";
+                        }
+
+                        Text {
+                            text: root.error-count;
+                            font-size: 24px;
+                            font-weight: 700;
+                            color: #dc2626;
+                        }
+                    }
+
+                    VerticalBox {
+                        Text {
+                            text: "RTT";
+                        }
+
+                        Text {
+                            text: root.rtt-text;
+                            font-size: 24px;
+                            font-weight: 700;
+                            color: #0f172a;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
