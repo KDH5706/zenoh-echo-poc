@@ -2,16 +2,18 @@
 
 mod zenoh_client;
 mod zenoh_peer;
+mod rtt_stats;
 
 use std::{
     collections::HashMap,
     error::Error,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use slint::ComponentHandle;
 use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
+use rtt_stats::RttStats;
 use zenoh::Session;
 
 slint::include_modules!();
@@ -20,6 +22,8 @@ const ECHO_REQUEST: &str = "scrubber/echo/request";
 const ECHO_REPLY: &str = "scrubber/echo/reply";
 
 type PendingMap = HashMap<u64, Instant>;
+const ECHO_TIMEOUT: Duration = Duration::from_secs(2);
+const AUTO_INTERVAL: Duration = Duration::from_millis(100);
 type SharedState = Arc<Mutex<AppState>>;
 type ConnectResult = Result<Session, Box<dyn Error + Send + Sync>>;
 
@@ -53,6 +57,8 @@ struct AppState {
     next_id: u64,
     pending: PendingMap,
     connection_mode: ConnectionMode,
+    stats: RttStats,
+    batch_running: bool,
 }
 
 fn append_log(ui: &AppWindow, message: &str) {
@@ -83,6 +89,81 @@ async fn close_connection(conn: Connection) {
         eprintln!("Zenoh close error: {e}");
     }
 }
+
+fn update_statistics(ui: &AppWindow, stats: &RttStats) {
+    let snap = stats.snapshot();
+    let ms = |value:Option<f64>| -> slint::SharedString {
+        value.map(|v| format!("{v:.2} ms"))
+            .unwrap_or_else(|| "-- ms".to_string()).into()
+    };
+    
+    ui.set_rtt_text(ms(snap.last));
+    ui.set_avg_rtt(ms(snap.mean));
+    ui.set_min_rtt(ms(snap.min));
+    ui.set_max_rtt(ms(snap.max));
+    ui.set_p50_rtt(ms(snap.p50));
+    ui.set_p95_rtt(ms(snap.p95));
+    ui.set_p99_rtt(ms(snap.p99));
+    ui.set_stddev_rtt(ms(snap.stddev));
+    ui.set_sample_count(snap.count.min(i32::MAX as usize) as i32);
+    ui.set_timeout_count(stats.timeouts.min(i32::MAX as u64) as i32);
+    ui.set_success_rate(format!("{:.1}%", stats.success_rate()).into());
+}
+
+async fn send_echo(
+    session: Session,
+    state: SharedState,
+    ui_weak: slint::Weak<AppWindow>,
+    generation: u64,
+    message: String,
+    quiet: bool,
+) -> bool {
+    let id = {
+        let mut st = state.lock().unwrap();
+        if st.generation != generation || st.connection.is_none() || st.busy {
+            return false;
+        }
+        st.next_id += 1;
+        let id = st.next_id;
+        st.pending.insert(id, Instant::now());
+        id
+    };
+    let payload = format!("{id}|{message}");
+    match session.put(ECHO_REQUEST, payload).await {
+        Ok(()) => {
+            let state_ui = state.clone();
+            post_ui(ui_weak, move |ui| {
+                if state_ui.lock().unwrap().generation != generation {
+                    return;
+                }
+                ui.set_tx_count(ui.get_tx_count() + 1);
+                if !quiet {
+                    append_log(&ui, &format!("[TX #{id}] {message}"));
+                }
+            });
+            true
+        }
+        Err(e) => {
+            {
+                let mut st = state.lock().unwrap();
+                if st.generation != generation { return false; }
+                st.pending.remove(&id);
+                st.stats.send_errors += 1;
+            }
+            let state_ui = state.clone();
+            post_ui(ui_weak, move |ui| {
+                let st = state_ui.lock().unwrap();
+                if st.generation != generation { return; }
+                update_statistics(&ui, &st.stats);
+                drop(st);
+                ui.set_error_count(ui.get_error_count() + 1);
+                append_log(&ui, &format!("[ERROR] Echo TX failed: {e}"));
+            });
+            false
+        }
+    }
+}
+
 
 fn main() -> Result<(), Box<dyn Error>> {
     let ui = AppWindow::new()?;
@@ -137,19 +218,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     ConnectionMode::Direct => {
                         // Slint SharedString → Rust String
                         let port = port.to_string();
-
-                        // Slint SharedString → Rust u32
-                        let baud: u32 = match baud.as_str().trim().parse() {
-                            Ok(value) if value > 0 => value,
-                            _ => {
-                                if let Some(ui) = ui_weak.upgrade() {
-                                    append_log(&ui, "[ERROR] Invalid baudrate");
-                                }
-                                return;
-                            }
-                        };
-
-                        zenoh_peer::connect_direct(&port, baud).await
+                        match baud.as_str().trim().parse::<u32>() {
+                            Ok(value) if value > 0 => zenoh_peer::connect_direct(&port, value).await,
+                            _ => Err("Invalid baudrate".into()),
+                        }
                     },
                 };
 
@@ -172,8 +244,29 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 let rx_ui = ui_weak.clone();
 
                                 let rx_task = tokio::spawn(async move {
+                                    let mut sweep = tokio::time::interval(Duration::from_millis(100));
                                     loop {
                                         tokio::select! {
+                                            _ = sweep.tick() => {
+                                                let (expired, snapshot) = {
+                                                    let mut st = rx_state.lock().unwrap();
+                                                    if st.generation != generation { break; }
+                                                    let before = st.pending.len();
+                                                    st.pending.retain(|_, at| at.elapsed() < ECHO_TIMEOUT);
+                                                    let expired = before - st.pending.len();
+                                                    st.stats.timeouts += expired as u64;
+                                                    (expired, st.stats.clone())
+                                                };
+                                                if expired > 0 {
+                                                    let state_ui = rx_state.clone();
+                                                    post_ui(rx_ui.clone(), move |ui| {
+                                                        if state_ui.lock().unwrap().generation != generation { return; }
+                                                        update_statistics(&ui, &snapshot);
+                                                        ui.set_error_count(ui.get_error_count() + expired as i32);
+                                                        append_log(&ui, &format!("[TIMEOUT] {expired} request(s) exceeded 2s"));
+                                                    });
+                                                }
+                                            }
                                             changed = stop_rx.changed() => {
                                                 if changed.is_err() || *stop_rx.borrow() {
                                                     break;
@@ -193,13 +286,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                                                     None => (None, text),
                                                 };
 
-                                                let rtt = {
+                                                let (rtt, snapshot) = {
                                                     let mut st = rx_state.lock().unwrap();
-                                                    if st.generation != generation {
-                                                        break;
+                                                    if st.generation != generation { break; }
+                                                    let rtt = id.and_then(|id| st.pending.remove(&id))
+                                                        .map(|start| start.elapsed());
+                                                    if let Some(rtt) = rtt {
+                                                        st.stats.record(rtt);
                                                     }
-                                                    id.and_then(|id| st.pending.remove(&id))
-                                                        .map(|start| start.elapsed())
+                                                    (rtt, st.stats.clone())
                                                 };
 
                                                 let ui_state = rx_state.clone();
@@ -208,12 +303,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                                                         return;
                                                     }
                                                     ui.set_rx_count(ui.get_rx_count() + 1);
-                                                    append_log(&ui, &format!("[RX] {content}"));
-                                                    if let Some(rtt) = rtt {
-                                                        ui.set_rtt_text(
-                                                            format!("{:.2} ms", rtt.as_secs_f64() * 1000.0).into()
-                                                        );
+                                                    if !ui.get_batch_running() {
+                                                        append_log(&ui, &format!("[RX] {content}"));
                                                     }
+                                                    if rtt.is_some() { update_statistics(&ui, &snapshot); }
                                                 });
                                             }
                                         }
@@ -357,7 +450,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // =====================================
-    // SEND ECHO
+    // SEND ECHO (manual)
     // =====================================
     {
         let ui_weak = ui.as_weak();
@@ -421,6 +514,103 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             });
+        });
+    }
+
+
+    // =====================================
+    // AUTO BENCHMARK: sequential requests with fixed spacing
+    // =====================================
+    {
+        let ui_weak = ui.as_weak();
+        let rt = rt.clone();
+        let state = state.clone();
+        ui.on_start_batch_requested(move |count, message| {
+            if !(1..=10000).contains(&count) { return; }
+            let (session, generation) = {
+                let mut st = state.lock().unwrap();
+                if st.busy || st.batch_running { return; }
+                let Some(session) = st.connection.as_ref().map(|c| c.session.clone()) else { return; };
+                st.batch_running = true;
+                (session, st.generation)
+            };
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_batch_running(true);
+                ui.set_batch_progress(format!("0 / {count}").into());
+                append_log(&ui, &format!("[BENCH] Starting {count} Echo requests (100ms interval)"));
+            }
+            let state = state.clone();
+            let ui_weak = ui_weak.clone();
+            let message = message.to_string();
+            rt.spawn(async move {
+                let mut sent = 0;
+                for n in 0..count {
+                    let running = {
+                        let st = state.lock().unwrap();
+                        st.generation == generation && st.batch_running && st.connection.is_some()
+                    };
+                    if !running { break; }
+                    if !send_echo(session.clone(), state.clone(), ui_weak.clone(), generation, message.clone(), true).await { break; }
+                    sent += 1;
+                    if n % 10 == 0 || n + 1 == count {
+                        let state_ui = state.clone();
+                        post_ui(ui_weak.clone(), move |ui| {
+                            if state_ui.lock().unwrap().generation == generation {
+                                ui.set_batch_progress(format!("{sent} / {count}").into());
+                            }
+                        });
+                    }
+                    tokio::time::sleep(AUTO_INTERVAL).await;
+                }
+                let current = {
+                    let mut st = state.lock().unwrap();
+                    if st.generation != generation { false } else {
+                        st.batch_running = false;
+                        true
+                    }
+                };
+                if current {
+                    let state_ui = state.clone();
+                    post_ui(ui_weak, move |ui| {
+                        if state_ui.lock().unwrap().generation != generation { return; }
+                        ui.set_batch_running(false);
+                        append_log(&ui, &format!("[BENCH] Finished sending {sent}/{count}; late replies/timeouts may still arrive"));
+                    });
+                }
+            });
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_stop_batch_requested(move || {
+            let mut st = state.lock().unwrap();
+            st.batch_running = false;
+            drop(st);
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_batch_running(false);
+                append_log(&ui, "[BENCH] Stop requested");
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_reset_statistics_requested(move || {
+            let mut st = state.lock().unwrap();
+            if st.batch_running { return; }
+            st.stats = RttStats::default();
+            st.pending.clear();
+            let snapshot = st.stats.clone();
+            drop(st);
+            if let Some(ui) = ui_weak.upgrade() {
+                update_statistics(&ui, &snapshot);
+                ui.set_tx_count(0);
+                ui.set_rx_count(0);
+                ui.set_error_count(0);
+                ui.set_batch_progress("0 / 0".into());
+                append_log(&ui, "[INFO] RTT statistics reset");
+            }
         });
     }
 

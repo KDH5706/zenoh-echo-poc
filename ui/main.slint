@@ -27,6 +27,18 @@ export component AppWindow inherits Window {
     in-out property <int> rx-count: 0;
     in-out property <int> error-count: 0;
     in-out property <string> rtt-text: "-- ms";
+    in-out property <string> avg-rtt: "-- ms";
+    in-out property <string> min-rtt: "-- ms";
+    in-out property <string> max-rtt: "-- ms";
+    in-out property <string> p50-rtt: "-- ms";
+    in-out property <string> p95-rtt: "-- ms";
+    in-out property <string> p99-rtt: "-- ms";
+    in-out property <string> stddev-rtt: "-- ms";
+    in-out property <string> success-rate: "0.0%";
+    in-out property <int> sample-count: 0;
+    in-out property <int> timeout-count: 0;
+    in-out property <bool> batch-running: false;
+    in-out property <string> batch-progress: "0 / 0";
     in-out property <string> log-text: "Waiting for communication...";
 
     // Rust에서 구현할 Callback
@@ -35,6 +47,9 @@ export component AppWindow inherits Window {
     callback send-requested(string);
     callback clear-log-requested();
     callback mode-changed(string);
+    callback start-batch-requested(int, string);
+    callback stop-batch-requested();
+    callback reset-statistics-requested();
 
     ScrollView {
 
@@ -186,7 +201,7 @@ export component AppWindow inherits Window {
 
                         Button {
                             text: "Send Echo";
-                            enabled: root.connected;
+                            enabled: root.connected && !root.batch-running;
 
                             clicked => {
                                 root.send-requested(message-input.text);
@@ -234,7 +249,61 @@ export component AppWindow inherits Window {
             }
 
             GroupBox {
-                title: "04. Communication Statistics";
+                title: "04. Automated RTT Benchmark";
+                height: 180px;
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 8px;
+                    HorizontalBox {
+                        Text {
+                            text: "Requests";
+                            vertical-alignment: center;
+                        }
+
+                        count-select := ComboBox {
+                            model: ["100", "500", "1000"];
+                            current-value: "100";
+                            enabled: !root.batch-running;
+                        }
+
+                        Button {
+                            text: "Start Benchmark";
+                            enabled: root.connected && !root.batch-running;
+                            clicked => {
+                                if (count-select.current-value == "100") {
+                                    root.start-batch-requested(100, message-input.text);
+                                }
+                                else if (count-select.current-value == "500") {
+                                    root.start-batch-requested(500, message-input.text);
+                                }
+                                else {
+                                    root.start-batch-requested(1000, message-input.text);
+                                }
+                            }
+                        }
+
+                        Button {
+                            text: "Stop";
+                            enabled: root.batch-running;
+                            clicked => { root.stop-batch-requested(); }
+                        }
+                    }
+
+                    Text {
+                        text: "Progress: " + root.batch-progress + "  |  100 ms interval  |  2 s timeout";
+                        color: #64748b;
+                    }
+
+                    Button {
+                        text: "Reset Statistics";
+                        enabled: !root.batch-running;
+                        clicked => { root.reset-statistics-requested(); }
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "05. Communication Statistics";
                 height: 150px;
 
                 HorizontalBox {
@@ -290,6 +359,140 @@ export component AppWindow inherits Window {
                             font-size: 24px;
                             font-weight: 700;
                             color: #0f172a;
+                        }
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "06. RTT Detailed Statistics";
+                height: 330px;
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 12px;
+                    HorizontalBox {
+                        VerticalBox {
+                            Text {
+                                text: "Samples";
+                            }
+
+                            Text {
+                                text: root.sample-count;
+                                font-size: 20px;
+                                color: #0f172a;
+                            }
+                        }
+
+                        VerticalBox {
+                            Text {
+                                text: "Average";
+                            }
+
+                            Text {
+                                text: root.avg-rtt;
+                                font-size: 20px;
+                                color: #0f172a;
+                            }
+                        }
+
+                        VerticalBox {
+                            Text {
+                                text: "Minimum";
+                            }
+
+                            Text {
+                                text: root.min-rtt;
+                                font-size: 20px;
+                                color: #0f172a;
+                            }
+                        }
+
+                        VerticalBox {
+                            Text {
+                                text: "Maximum";
+                            }
+
+                            Text {
+                                text: root.max-rtt;
+                                font-size: 20px;
+                                color: #0f172a;
+                            }
+                        }
+                    }
+
+                    HorizontalBox {
+                        VerticalBox {
+                            Text {
+                                text: "P50";
+                            }
+
+                            Text {
+                                text: root.p50-rtt;
+                                font-size: 20px;
+                                color: #2563eb;
+                            }
+                        }
+
+                        VerticalBox {
+                            Text {
+                                text: "P95";
+                            }
+
+                            Text {
+                                text: root.p95-rtt;
+                                font-size: 20px;
+                                color: #d97706;
+                            }
+                        }
+
+                        VerticalBox {
+                            Text {
+                                text: "P99";
+                            }
+
+                            Text {
+                                text: root.p99-rtt;
+                                font-size: 20px;
+                                color: #dc2626;
+                            }
+                        }
+
+                        VerticalBox {
+                            Text {
+                                text: "Std Dev";
+                            }
+
+                            Text {
+                                text: root.stddev-rtt;
+                                font-size: 20px;
+                                color: #0f172a;
+                            }
+                        }
+                    }
+
+                    HorizontalBox {
+                        VerticalBox {
+                            Text {
+                                text: "Timeouts";
+                            }
+
+                            Text {
+                                text: root.timeout-count;
+                                font-size: 20px;
+                                color: #dc2626;
+                            }
+                        }
+
+                        VerticalBox {
+                            Text {
+                                text: "Success Rate";
+                            }
+
+                            Text {
+                                text: root.success-rate;
+                                font-size: 20px;
+                                color: #16a34a;
+                            }
                         }
                     }
                 }
