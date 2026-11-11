@@ -20,6 +20,7 @@ slint::include_modules!();
 
 const ECHO_REQUEST: &str = "scrubber/echo/request";
 const ECHO_REPLY: &str = "scrubber/echo/reply";
+const MCU_DISCONNECT_REQUEST: &str = "scrubber/control/disconnect";
 
 type PendingMap = HashMap<u64, Instant>;
 const ECHO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -35,9 +36,8 @@ struct Connection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionMode {
-    #[default]
     Router,
-    Direct,
+    #[default] Direct,
 }
 
 impl ConnectionMode {
@@ -81,22 +81,68 @@ where
     let _ = ui.upgrade_in_event_loop(f);
 }
 
-async fn close_connection(conn: Connection) {
+async fn close_connection(mut conn: Connection) {
+    println!("[Zenoh] Disconnect requested");
+
+    // 1. RX Task에 종료 요청
     let _ = conn.stop_tx.send(true);
-    conn.rx_task.abort();
-    let _ = conn.rx_task.await;
-    if let Err(e) = conn.session.close().await {
-        eprintln!("Zenoh close error: {e}");
+
+    // 2. RX Task 정상 종료 대기 (최대 2초)
+    match tokio::time::timeout(Duration::from_secs(2), &mut conn.rx_task).await {
+        Ok(result) => {
+            println!("[Zenoh] RX task stopped: {:?}", result);
+        }
+        Err(_) => {
+            eprintln!("[Zenoh] RX task timeout, aborting...");
+
+            conn.rx_task.abort();
+            let _ = conn.rx_task.await;
+        }
     }
+
+    // 3. Zenoh Session 종료
+    println!("[Zenoh] Closing session...");
+
+    let start = Instant::now();
+
+    match conn.session.close().await {
+        Ok(()) => {
+            println!(
+                "[Zenoh] Session closed successfully ({:?})",
+                start.elapsed()
+            );
+        }
+
+        Err(e) => {
+            eprintln!(
+                "[Zenoh] Session close failed after {:?}: {}",
+                start.elapsed(),
+                e
+            );
+        }
+    }
+
+    println!("[Zenoh] Disconnect finished");
 }
+
+async fn request_mcu_disconnect(session: &Session, ) -> Result<(), zenoh::Error> {
+    session
+    .put(MCU_DISCONNECT_REQUEST, "disconnect")
+    .await?;
+
+    Ok(())
+}
+
 
 fn update_statistics(ui: &AppWindow, stats: &RttStats) {
     let snap = stats.snapshot();
-    let ms = |value:Option<f64>| -> slint::SharedString {
-        value.map(|v| format!("{v:.2} ms"))
-            .unwrap_or_else(|| "-- ms".to_string()).into()
+    let ms = |value: Option<f64>| -> slint::SharedString {
+        value
+            .map(|v| format!("{v:.2} ms"))
+            .unwrap_or_else(|| "-- ms".to_string())
+            .into()
     };
-    
+
     ui.set_rtt_text(ms(snap.last));
     ui.set_avg_rtt(ms(snap.mean));
     ui.set_min_rtt(ms(snap.min));
@@ -146,14 +192,18 @@ async fn send_echo(
         Err(e) => {
             {
                 let mut st = state.lock().unwrap();
-                if st.generation != generation { return false; }
+                if st.generation != generation {
+                    return false;
+                }
                 st.pending.remove(&id);
                 st.stats.send_errors += 1;
             }
             let state_ui = state.clone();
             post_ui(ui_weak, move |ui| {
                 let st = state_ui.lock().unwrap();
-                if st.generation != generation { return; }
+                if st.generation != generation {
+                    return;
+                }
                 update_statistics(&ui, &st.stats);
                 drop(st);
                 ui.set_error_count(ui.get_error_count() + 1);
@@ -450,6 +500,76 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // =====================================
+    // MCU DISCONNECT
+    // =====================================
+    {
+        let ui_weak = ui.as_weak();
+        let rt = rt.clone();
+        let state = state.clone();
+
+        ui.on_mcu_disconnect_requested(move || {
+            let (session, generation) = {
+                let st = state.lock().unwrap();
+
+                // 연결 중이거나 종료 처리 중이면 요청하지 않음
+                if st.busy || st.batch_running {
+                    return;
+                }
+
+                let Some(session) = st
+                    .connection
+                    .as_ref()
+                    .map(|conn| conn.session.clone())
+                else {
+                    return;
+                };
+
+                (session, st.generation)
+            };
+
+            let ui_weak = ui_weak.clone();
+            let state = state.clone();
+
+            rt.spawn(async move {
+                let result = request_mcu_disconnect(&session).await;
+
+                post_ui(ui_weak, move |ui| {
+                    let st = state.lock().unwrap();
+
+                    if st.generation != generation {
+                        return;
+                    }
+
+                    drop(st);
+
+                    match result {
+                        Ok(()) => {
+                            append_log(
+                                &ui,
+                                "[MCU] Disconnect request published",
+                            );
+                        }
+
+                        Err(e) => {
+                            ui.set_error_count(
+                                ui.get_error_count() + 1
+                            );
+
+                            append_log(
+                                &ui,
+                                &format!(
+                                    "[ERROR] MCU disconnect request failed: {e}"
+                                ),
+                            );
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+
+    // =====================================
     // SEND ECHO (manual)
     // =====================================
     {
@@ -516,7 +636,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             });
         });
     }
-
+    
 
     // =====================================
     // AUTO BENCHMARK: sequential requests with fixed spacing
@@ -598,7 +718,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let state = state.clone();
         ui.on_reset_statistics_requested(move || {
             let mut st = state.lock().unwrap();
-            if st.batch_running { return; }
+            if st.batch_running {
+                return;
+            }
             st.stats = RttStats::default();
             st.pending.clear();
             let snapshot = st.stats.clone();

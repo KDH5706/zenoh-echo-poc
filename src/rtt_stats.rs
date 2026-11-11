@@ -22,7 +22,7 @@ pub struct Snapshot {
 impl RttStats {
   pub fn record(&mut self, duration: Duration) {
     //Retain up to 100,000 samples; percential metrics cover the retained window.
-    if self.samples.len() == 100_1000 { self.samples.remove(0); }
+    if self.samples.len() == 100_000 { self.samples.remove(0); }
     self.samples.push(duration.as_secs_f64() * 1000.0);
     
   }

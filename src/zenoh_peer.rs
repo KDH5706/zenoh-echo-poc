@@ -5,7 +5,7 @@ pub async fn connect_direct(
     port: &str,
     baud: u32,
 ) -> Result<zenoh::Session, Box<dyn Error + Send + Sync>> {
-
+    
     if port.trim().is_empty() {
         return Err("Serial port is empty".into());
     }

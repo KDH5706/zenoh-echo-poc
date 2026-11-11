@@ -12,8 +12,10 @@ import {
 
 export component AppWindow inherits Window {
     title: "Zenoh Echo Tester";
-    width: 1024px;
-    height: 768px;
+    // width: 1024px;
+    // height: 768px;
+    width: 1920px;
+    height: 1080px;
     background: #f3f5f9;
 
     // Rust 백엔드와 연결할 속성
@@ -21,7 +23,7 @@ export component AppWindow inherits Window {
     in-out property <string> session-status: "Disconnected";
     in-out property <string> serial-port: "/dev/scrubber-controller";
     in-out property <string> baud-rate: "115200";
-    in-out property <string> selected-mode: "client";
+    in-out property <string> selected-mode: "Peer";
 
     in-out property <int> tx-count: 0;
     in-out property <int> rx-count: 0;
@@ -50,6 +52,7 @@ export component AppWindow inherits Window {
     callback start-batch-requested(int, string);
     callback stop-batch-requested();
     callback reset-statistics-requested();
+    callback mcu-disconnect-requested();
 
     ScrollView {
 
@@ -145,6 +148,16 @@ export component AppWindow inherits Window {
                             color: #64748b;
                             vertical-alignment: center;
                         }
+
+                        Button {
+                            text: "Requests MCU Disconnect";
+                            enabled: root.connected
+                                && !root.batch-running;
+
+                            clicked => {
+                                root.mcu-disconnect-requested();
+                            }
+                        }
                     }
 
                     HorizontalBox {
@@ -166,11 +179,11 @@ export component AppWindow inherits Window {
                             }
 
                             RadioButton {
-                                checked: true;
                                 text: "Client";
                             }
 
                             RadioButton {
+                                checked: true;
                                 text: "Peer";
                             }
                         }
