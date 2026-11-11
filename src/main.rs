@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod rtt_stats;
 mod zenoh_client;
 mod zenoh_peer;
-mod rtt_stats;
 
 use std::{
     collections::HashMap,
@@ -11,16 +11,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rtt_stats::RttStats;
 use slint::ComponentHandle;
 use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
-use rtt_stats::RttStats;
 use zenoh::Session;
 
 slint::include_modules!();
 
-const ECHO_REQUEST: &str = "scrubber/echo/request";
-const ECHO_REPLY: &str = "scrubber/echo/reply";
-const MCU_DISCONNECT_REQUEST: &str = "scrubber/control/disconnect";
+const ECHO_REQUEST_KEY: &str = "scrubber/echo/request";
+const ECHO_REPLY_KEY: &str = "scrubber/echo/reply";
+
+const DISCONNECT_REQ_KEY: &str = "scrubber/control/disconnect";
+
+const HEARTBEAT_RPI_KEY: &str = "scrubber/heartbeat/rpi";
+// const HEARTBEAT_MCU_KEY: &str = "scrubber/heartbeat/mcu";
 
 type PendingMap = HashMap<u64, Instant>;
 const ECHO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -32,12 +36,14 @@ struct Connection {
     session: Session,
     stop_tx: watch::Sender<bool>,
     rx_task: JoinHandle<()>,
+    heartbeat_tx_task: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionMode {
     Router,
-    #[default] Direct,
+    #[default]
+    Direct,
 }
 
 impl ConnectionMode {
@@ -100,7 +106,19 @@ async fn close_connection(mut conn: Connection) {
         }
     }
 
-    // 3. Zenoh Session 종료
+    // 3. Heartbeat TX Task 종료 대기
+    match tokio::time::timeout(Duration::from_secs(2), &mut conn.heartbeat_tx_task).await {
+        Ok(result) => {
+            println!("[Heartbeat] TX task stopped: {:?}", result);
+        }
+        Err(_) => {
+            eprintln!("[Heartbeat] TX task timeout, aborting...");
+            conn.heartbeat_tx_task.abort();
+            let _ = conn.heartbeat_tx_task.await;
+        }
+    }
+
+    // 4. Zenoh Session 종료
     println!("[Zenoh] Closing session...");
 
     let start = Instant::now();
@@ -127,7 +145,7 @@ async fn close_connection(mut conn: Connection) {
 
 async fn request_mcu_disconnect(session: &Session, ) -> Result<(), zenoh::Error> {
     session
-    .put(MCU_DISCONNECT_REQUEST, "disconnect")
+    .put(DISCONNECT_REQ_KEY, "disconnect")
     .await?;
 
     Ok(())
@@ -175,7 +193,7 @@ async fn send_echo(
         id
     };
     let payload = format!("{id}|{message}");
-    match session.put(ECHO_REQUEST, payload).await {
+    match session.put(ECHO_REQUEST_KEY, payload).await {
         Ok(()) => {
             let state_ui = state.clone();
             post_ui(ui_weak, move |ui| {
@@ -287,9 +305,65 @@ fn main() -> Result<(), Box<dyn Error>> {
                             return;
                         }
 
-                        match session.declare_subscriber(ECHO_REPLY).await {
+                        match session.declare_subscriber(ECHO_REPLY_KEY).await {
                             Ok(subscriber) => {
                                 let (stop_tx, mut stop_rx) = watch::channel(false);
+
+                                //Heartbeat TX Task 생성
+                                let hb_session = session.clone();
+                                let mut hb_stop_rx = stop_tx.subscribe();
+
+                                let heartbeat_tx_task = tokio::spawn(async move {
+                                    let mut interval = tokio::time::interval(Duration::from_millis(500));
+                                    interval.set_missed_tick_behavior(
+                                        tokio::time::MissedTickBehavior::Skip
+                                    );
+
+                                    loop {
+                                        tokio::select! {
+                                            biased;
+
+                                            changed = hb_stop_rx.changed() => {
+                                                if changed.is_err() || *hb_stop_rx.borrow() {
+                                                    break;
+                                                }
+                                            }
+
+                                            _ = interval.tick() => {
+                                                if let Err(e) = hb_session
+                                                    .put(HEARTBEAT_RPI_KEY, "alive")
+                                                    .await
+                                                {
+                                                    eprintln!("[Heartbeat] TX failed: {e}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    println!("[Heartbeat] TX task stopped");
+                                });
+
+                                // let heartbeat_tx_task = tokio::spawn(async move {
+                                //     let mut sweep = tokio::time::interval(Duration::from_millis(500));
+                                //     let payload = format!("a ");
+                                //     loop {
+                                //         tokio::select! {
+                                //             _ = sweep.tick() => {
+                                //                 session.put(HEARTBEAT_RPI_KEY, payload).await;
+                                //             }
+                                //             changed = stop_rx.changed() => {
+                                //                 if changed.is_err() || *stop_rx.borrow() {
+                                //                     break;
+                                //                 }
+                                //             }
+                                //         }
+                                //     }                                    
+                                // });
+
+
+
+
+
                                 let rx_state = state.clone();
                                 let rx_ui = ui_weak.clone();
 
@@ -363,7 +437,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 });
 
-                                let connection = Connection { session, stop_tx, rx_task };
+                                let connection = Connection { session, stop_tx, rx_task, heartbeat_tx_task };
                                 let mut maybe_connection = Some(connection);
                                 let accepted = {
                                     let mut st = state.lock().unwrap();
@@ -517,9 +591,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 let Some(session) = st
-                    .connection
-                    .as_ref()
-                    .map(|conn| conn.session.clone())
+                .connection
+                .as_ref()
+                .map(|conn| conn.session.clone()) 
                 else {
                     return;
                 };
@@ -544,30 +618,19 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                     match result {
                         Ok(()) => {
-                            append_log(
-                                &ui,
-                                "[MCU] Disconnect request published",
-                            );
+                            append_log(&ui, "[MCU] Disconnect request published");
                         }
 
                         Err(e) => {
-                            ui.set_error_count(
-                                ui.get_error_count() + 1
-                            );
+                            ui.set_error_count(ui.get_error_count() + 1);
 
-                            append_log(
-                                &ui,
-                                &format!(
-                                    "[ERROR] MCU disconnect request failed: {e}"
-                                ),
-                            );
+                            append_log(&ui, &format!("[ERROR] MCU disconnect request failed: {e}"));
                         }
                     }
                 });
             });
         });
     }
-
 
     // =====================================
     // SEND ECHO (manual)
@@ -599,7 +662,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let state = state.clone();
 
             rt.spawn(async move {
-                match session.put(ECHO_REQUEST, payload).await {
+                match session.put(ECHO_REQUEST_KEY, payload).await {
                     Ok(()) => {
                         let ui_state = state.clone();
                         post_ui(ui_weak, move |ui| {
@@ -636,7 +699,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             });
         });
     }
-    
 
     // =====================================
     // AUTO BENCHMARK: sequential requests with fixed spacing
